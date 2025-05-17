@@ -1,0 +1,667 @@
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local LocalPlayer = Players.LocalPlayer
+local Character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+local Humanoid = Character:WaitForChild("Humanoid")
+local RootPart = Character:WaitForChild("HumanoidRootPart")
+
+local AdvancedAI = {}
+AdvancedAI.__index = AdvancedAI
+
+function AdvancedAI.new()
+    local self = setmetatable({}, AdvancedAI)
+    self.character = Character
+    self.humanoid = Humanoid
+    self.rootPart = RootPart
+    self.targets = {}
+    self.state = "Idle"
+    self.lastAttackTime = 0
+    self.attackCooldown = 0.5
+    self.lungeCooldown = 1.5
+    self.lastLungeTime = 0
+    self.dodgeCooldown = 1
+    self.lastDodgeTime = 0
+    self.isActive = false
+    self.isAttacking = false
+    self.isLunging = false
+    self.lastTargetPositions = {}
+    self.targetVelocityThreshold = 20
+    self.toolLength = 2.5
+    self.lastHealth = Humanoid.Health
+    self.lastScanTime = 0
+    self.scanCooldown = 0.1
+    self.turnSpeed = 0.5
+    self.safeDistance = 10  -- Distance to maintain from spinning players
+    self.jukeInterval = 3   -- Time between jukes
+    self.lastJukeTime = 0
+    self.toolGrip = Grips.Out
+    self.enemyExtended = false
+    self.maxFallSpeed = 50  -- Maximum fall speed to prevent flying
+    return self
+end
+
+local Funcs = {}
+
+Funcs.GetDist = function(Model, Position)
+    if Model and Model:FindFirstChild("Right Arm") then
+        return (Model["Right Arm"].Position - Position).Magnitude
+    else
+        return math.huge -- Return a large number if Right Arm doesn't exist
+    end
+end
+
+Funcs.GetClosestEnemy = function(Model)
+    local ClosestEnemy = nil
+    local ClosestDistance = math.huge
+    for i, v in pairs(workspace.ActivePlayers:GetChildren()) do
+        if v ~= Model and v:FindFirstChild("HumanoidRootPart") and v:FindFirstChild("Humanoid") then
+            if v.Humanoid.Health ~= 0 then
+                local Dist = (v.HumanoidRootPart.Position - Model.HumanoidRootPart.Position).Magnitude
+                if Dist < ClosestDistance then
+                    ClosestDistance = Dist
+                    ClosestEnemy = v
+                end
+            end
+        end
+    end
+    return ClosestEnemy
+end
+
+Funcs.GetDistance = function(Model, OtherModel)
+    if Model and Model:FindFirstChild("HumanoidRootPart") and OtherModel and OtherModel:FindFirstChild("HumanoidRootPart") then
+        return (Model.HumanoidRootPart.Position - OtherModel.HumanoidRootPart.Position).Magnitude
+    else
+        return math.huge
+    end
+end
+
+Funcs.GetClosestPart = function(Position, OtherModel)
+    local ClosestPart = nil
+    local ClosestDistance = math.huge
+    if OtherModel then
+        for i, v in pairs(OtherModel:GetChildren()) do
+            if v:IsA("BasePart") then
+                local Offset = Vector3.new(0, 0, 0)
+                if v.Name == "Right Arm" then
+                    Offset = OtherModel.HumanoidRootPart.CFrame.LookVector * 3
+                end
+                local Dist = (Position - (v.Position + Offset)).Magnitude
+                if Dist < ClosestDistance then
+                    ClosestDistance = Dist
+                    ClosestPart = v
+                end
+            end
+        end
+    end
+    return ClosestPart
+end
+
+Funcs.GetRetreatDirection = function(Model, ClosestEnemy, Dist)
+    if not Model or not ClosestEnemy or not Model:FindFirstChild("HumanoidRootPart") or not ClosestEnemy:FindFirstChild("HumanoidRootPart") then
+        return nil
+    end
+    local Difference = (Model.HumanoidRootPart.Position - ClosestEnemy.HumanoidRootPart.Position)
+    local Params = RaycastParams.new()
+    Params.FilterType = Enum.RaycastFilterType.Blacklist
+    Params.FilterDescendantsInstances = {workspace.ActivePlayers}
+    local Angle = -135
+    local BestDist = 0
+    local BestPosition = nil
+    local Raycasts = 10
+    for i = 1, Raycasts do
+        local Raycast = workspace:Raycast(Model.HumanoidRootPart.Position, (CFrame.lookAt(Model.HumanoidRootPart.Position, Model.HumanoidRootPart.Position + Difference) * CFrame.Angles(0, math.rad(Angle), 0)).LookVector * Dist, Params)
+        if Raycast then
+            local Dist = (Raycast.Position - ClosestEnemy.HumanoidRootPart.Position).Magnitude
+            if Dist > BestDist then
+                BestPosition = Raycast.Position
+                BestDist = Dist
+            end
+        end
+        Angle += 270 / Raycasts
+    end
+    return BestPosition
+end
+
+Funcs.SideCast = function(ClosestEnemy)
+    if not ClosestEnemy or not ClosestEnemy:FindFirstChild("HumanoidRootPart") then
+        return nil
+    end
+    local Params = RaycastParams.new()
+    Params.FilterType = Enum.RaycastFilterType.Blacklist
+    Params.FilterDescendantsInstances = {workspace.ActivePlayers}
+    local Angle = 0
+    local BestDist = 0
+    local BestPosition = nil
+    local Raycasts = 10
+    for i = 1, Raycasts do
+        local Raycast = workspace:Raycast(ClosestEnemy.HumanoidRootPart.Position, (ClosestEnemy.HumanoidRootPart.CFrame * CFrame.Angles(0, math.rad(Angle), 0)).LookVector * 8, Params)
+        Angle += 360 / Raycasts
+        if Raycast then
+            return Raycast
+        end
+    end
+end
+
+local VisualizePosition = function(Position)
+    local Part = Instance.new("Part")
+    Part.Position = Position
+    Part.CanCollide = false
+    Part.Parent = workspace.Filter
+    Part.Size = Vector3.new(0.1, 0.1, 0.1)
+    Part.Anchored = true
+end
+
+local function GetDist(Model, Position)
+    if Model and Model:FindFirstChild("Right Arm") then
+        return (Model["Right Arm"].Position - Position).Magnitude
+    else
+        return math.huge
+    end
+end
+
+Funcs.FindBestAngle = function(Model, Enemy, EnemyTool)
+    if not Model or not Model:FindFirstChild("Right Arm") or not Model:FindFirstChild("HumanoidRootPart") then
+        return 0
+    end
+    local Params = RaycastParams.new()
+    Params.FilterType = Enum.RaycastFilterType.Blacklist
+    Params.FilterDescendantsInstances = {Model, workspace.Filter, EnemyTool, table.unpack(Enemy.Humanoid:GetAccessories()), workspace}
+    local Raycasts = {}
+    table.insert(Raycasts, {workspace:Raycast(Model["Right Arm"].Position, Model.HumanoidRootPart.CFrame.LookVector * 10, Params), 0})
+    table.insert(Raycasts, {workspace:Raycast(Model["Right Arm"].Position, (Model.HumanoidRootPart.CFrame * CFrame.Angles(0, -math.rad(1), 0)).LookVector.Unit * 10, Params), -1})
+    table.insert(Raycasts, {workspace:Raycast(Model["Right Arm"].Position, (Model.HumanoidRootPart.CFrame * CFrame.Angles(0, math.rad(1), 0)).LookVector.Unit * 10, Params), 1})
+    table.insert(Raycasts, {workspace:Raycast(Model["Right Arm"].Position, (Model.HumanoidRootPart.CFrame * CFrame.Angles(0, math.rad(2), 0)).LookVector.Unit * 10, Params), 2})
+    table.insert(Raycasts, {workspace:Raycast(Model["Right Arm"].Position, (Model.HumanoidRootPart.CFrame * CFrame.Angles(0, -math.rad(2), 0)).LookVector.Unit * 10, Params), -2})
+    workspace.Filter:ClearAllChildren()
+    local ClosestDistance = math.huge
+    local ClosestAngle = 0
+    local ClosestPos = nil
+    for i, v in pairs(Raycasts) do
+        if v[1] then
+            local Dist = GetDist(Model, v[1].Position)
+            VisualizePosition(v[1].Position)
+            if Dist < ClosestDistance then
+                ClosestDistance = Dist
+                ClosestAngle = v[2]
+                ClosestPos = v[1].Position
+            end
+        end
+    end
+    return ClosestAngle
+end
+
+local GetXDist = function(Pos1, Pos2)
+    return math.sqrt((Pos1.X - Pos2.X) ^ 2 + (Pos1.Z - Pos2.Z) ^ 2)
+end
+
+local FairLookAt = function(Pos1, Pos2)
+    return CFrame.lookAt(Pos1, (Pos2 - Vector3.new(0, Pos2.Y - Pos1.Y, 0))) * CFrame.Angles(0, math.rad(17.5), 0)
+end
+
+Grips = {
+    Up = CFrame.new(0, 0, -1.70000005, 0, 0, 1, 1, 0, 0, 0, 1, 0),
+    Out = CFrame.new(0, 0, -1.70000005, 0, 1, 0, 1, -0, 0, 0, 0, -1)
+}
+
+function AdvancedAI:IsPlayerAttacking(player)
+    if not player or not player.Character then return false end
+    local character = player.Character
+    if not character then return false end
+
+    local humanoid = character:FindFirstChild("Humanoid")
+    if not humanoid then return false end
+
+    local tool = character:FindFirstChildOfClass("Tool")
+    if not tool then return false end
+
+    for _, track in pairs(humanoid:GetPlayingAnimationTracks()) do
+        if track.Name:lower():match("attack") or track.Name:lower():match("swing") then
+            return true
+        end
+    end
+
+    return false
+end
+
+function AdvancedAI:ScanForThreats()
+    if tick() - self.lastScanTime < self.scanCooldown then return self.targets end
+
+    local threats = {}
+
+    for _, player in pairs(Players:GetPlayers()) do
+        if player ~= LocalPlayer and player.Character then
+            local playerRoot = player.Character:FindFirstChild("HumanoidRootPart")
+            if playerRoot then
+                local distance = (playerRoot.Position - self.rootPart.Position).Magnitude
+                if distance < 50 then  -- Only consider players within 50 studs
+                    table.insert(threats, player.Character)
+                end
+            end
+        end
+    end
+
+    self.lastScanTime = tick()
+    return threats
+end
+
+function AdvancedAI:PredictTargetPosition(target, timeAhead)
+    if not target or not target:FindFirstChild("HumanoidRootPart") then
+        return self.rootPart.Position
+    end
+    local currentPosition = target.HumanoidRootPart.Position
+    local currentVelocity = target.HumanoidRootPart.Velocity
+    return currentPosition + (currentVelocity * timeAhead)
+end
+
+function AdvancedAI:CalculateAngle(targetPosition)
+    local direction = (targetPosition - self.rootPart.Position).Unit
+    local angle = math.deg(math.acos(direction:Dot(self.rootPart.CFrame.LookVector)))
+    return angle
+end
+
+function AdvancedAI:FindBestPosition(targetPosition)
+    local bestPosition = targetPosition
+    local bestScore = -math.huge
+
+    for angle = 0, 359, 10 do
+        local radAngle = math.rad(angle)
+        local offsetVector = Vector3.new(math.cos(radAngle), 0, math.sin(radAngle)) * 5
+        local potentialPosition = targetPosition + offsetVector
+
+        local score = self:EvaluatePosition(potentialPosition, targetPosition)
+
+        if score > bestScore then
+            bestScore = score
+            bestPosition = potentialPosition
+        end
+    end
+
+    if bestScore < 0 then
+        local behindOffset = (targetPosition - self.rootPart.Position).Unit * -5
+        bestPosition = targetPosition + behindOffset
+    end
+
+    return bestPosition
+end
+
+function AdvancedAI:EvaluatePosition(position, targetPosition)
+    local distanceToTarget = (position - targetPosition).Magnitude
+    local distanceToSelf = (position - self.rootPart.Position).Magnitude
+    local lineOfSight = self:HasLineOfSight(position, targetPosition)
+
+    local score = 0
+    score = score + (10 - distanceToTarget) * 2
+    score = score + (10 - distanceToSelf)
+    score = score + (lineOfSight and 5 or 0)
+
+    for _, target in ipairs(self.targets) do
+        if target and target:FindFirstChild("HumanoidRootPart") then
+            local toPosition = (position - target.HumanoidRootPart.Position).Unit
+            local targetRight = target.HumanoidRootPart.CFrame.RightVector
+            local rightSideness = toPosition:Dot(targetRight)
+            score = score - rightSideness * 10
+
+            local targetBack = -target.HumanoidRootPart.CFrame.LookVector
+            local behindness = toPosition:Dot(targetBack)
+            score = score + behindness * 5
+        end
+    end
+
+    return score
+end
+
+function AdvancedAI:HasLineOfSight(fromPosition, toPosition)
+    local ray = Ray.new(fromPosition, toPosition - fromPosition)
+    local hit, _ = workspace:FindPartOnRayWithIgnoreList(ray, {self.character})
+    return hit == nil
+end
+
+function AdvancedAI:Attack()
+    if tick() - self.lastAttackTime > self.attackCooldown then
+        self.isAttacking = true
+        mouse1press()
+        wait(0.1)
+        mouse1release()
+        self.lastAttackTime = tick()
+        self.isAttacking = false
+    end
+end
+
+function AdvancedAI:Lunge()
+    if tick() - self.lastLungeTime > self.lungeCooldown then
+        self.isLunging = true
+        mouse1press()
+        wait(1.5)
+        mouse1release()
+        self.lastLungeTime = tick()
+        self.isLunging = false
+    end
+end
+
+function AdvancedAI:Dodge()
+    if tick() - self.lastDodgeTime > self.dodgeCooldown then
+        local dodgeDirection = Vector3.new(math.random() - 0.5, 0, math.random() - 0.5).Unit
+        self.humanoid:Move(dodgeDirection * 20)
+        self.lastDodgeTime = tick()
+    end
+end
+
+function AdvancedAI:Move(targetPosition)
+    if self.humanoid.RootPart.Velocity.Y < -self.maxFallSpeed then
+        self.humanoid.RootPart.Velocity = Vector3.new(self.humanoid.RootPart.Velocity.X, -self.maxFallSpeed, self.humanoid.RootPart.Velocity.Z)
+    end
+    self.humanoid:MoveTo(targetPosition)
+end
+
+function AdvancedAI:IsTargetSpinning(target)
+    if not target or not target:FindFirstChild("HumanoidRootPart") then
+        return false
+    end
+    if not self.lastTargetPositions[target] then
+        self.lastTargetPositions[target] = { pos = target.HumanoidRootPart.Position, time = tick() }
+        return false
+    end
+
+    local lastPos = self.lastTargetPositions[target].pos
+    local lastTime = self.lastTargetPositions[target].time
+    local currentPos = target.HumanoidRootPart.Position
+    local currentTime = tick()
+
+    local timeDiff = currentTime - lastTime
+    local posDiff = (currentPos - lastPos).Magnitude
+
+    local speed = posDiff / timeDiff
+
+    self.lastTargetPositions[target] = { pos = currentPos, time = currentTime }
+
+    return speed > 30  -- Adjust this threshold as needed
+end
+
+function AdvancedAI:Juke()
+    if tick() - self.lastJukeTime > self.jukeInterval then
+        local jukeDirection = Vector3.new(math.random() - 0.5, 0, math.random() - 0.5).Unit
+        self.humanoid:Move(jukeDirection * 15)
+        self.lastJukeTime = tick()
+    end
+end
+
+function AdvancedAI:AimCharacterAndTool(targetPosition)
+    local tool = self.character:FindFirstChildOfClass("Tool")
+    if not tool then return end
+    local handle = tool:FindFirstChild("Handle")
+    if not handle then return end
+
+    local characterLookAt = CFrame.new(self.rootPart.Position, Vector3.new(targetPosition.X, self.rootPart.Position.Y, targetPosition.Z))
+    self.rootPart.CFrame = self.rootPart.CFrame:Lerp(characterLookAt, self.turnSpeed)
+
+    local toolTip = handle.Position + handle.CFrame.LookVector * self.toolLength
+    local toolLookAt = CFrame.new(toolTip, targetPosition)
+    handle.CFrame = handle.CFrame:Lerp(toolLookAt, 0.4)
+end
+
+function AdvancedAI:IsTakingDamage()
+    local currentHealth = self.humanoid.Health
+    if currentHealth < self.lastHealth then
+        self.lastHealth = currentHealth
+        return true
+    end
+    self.lastHealth = currentHealth
+    return false
+end
+
+function AdvancedAI:Think()
+    if not self.isActive then return end
+
+    self.targets = self:ScanForThreats()
+
+    if #self.targets > 0 then
+        local closestTarget = self.targets[1]
+        local closestDistance = (closestTarget.HumanoidRootPart.Position - self.rootPart.Position).Magnitude
+
+        for _, target in ipairs(self.targets) do
+            if target and target:FindFirstChild("HumanoidRootPart") then
+                local targetRoot = target.HumanoidRootPart
+                local distance = (targetRoot.Position - self.rootPart.Position).Magnitude
+
+                if distance < closestDistance then
+                    closestTarget = target
+                    closestDistance = distance
+                end
+
+                if self:IsTargetSpinning(target) then
+                    local awayVector = (self.rootPart.Position - targetRoot.Position).Unit
+                    local safePosition = targetRoot.Position + awayVector * self.safeDistance
+                    self:Move(safePosition)
+                    return
+                end
+            end
+        end
+
+        local predictedPosition = self:PredictTargetPosition(closestTarget, 0.2)
+        local bestPosition = self:FindBestPosition(predictedPosition)
+
+        self:AimCharacterAndTool(predictedPosition)
+        self:Move(bestPosition)
+
+        local EnemyTool = closestTarget:FindFirstChildOfClass("Tool")
+        local LungeCooldown = false
+        if EnemyTool then
+            if EnemyTool.Grip == Grips.Out then
+                if self.enemyExtended == false then
+                    self.LastOpponentAttack = tick()
+                end
+                self.enemyExtended = true
+            end
+        end
+        if self.toolGrip ~= Grips.Out then
+            LungeCooldown = true
+        end
+
+        if self:IsTakingDamage() then
+            self:Dodge()
+        else
+            if closestDistance > 6 then
+                -- Continue moving
+            elseif closestDistance > 3 then
+                if not self.isLunging then
+                    self:Lunge()
+                end
+            else
+                if not self.isAttacking then
+                    self:Attack()
+                end
+            end
+
+            self:Juke()
+
+            if self:IsPlayerAttacking(Players:GetPlayerFromCharacter(closestTarget)) and not self.isAttacking and not self.isLunging then
+                self:Dodge()
+            end
+
+            local HigherHp = self.humanoid.Health > closestTarget.Humanoid.Health
+            local LowerHp = self.humanoid.Health < closestTarget.Humanoid.Health
+            local XDist = GetXDist(self.rootPart.Position, closestTarget.HumanoidRootPart.Position)
+            local Distance = Funcs.GetDistance(self, closestTarget)
+            local HeightDifference = math.abs(closestTarget.HumanoidRootPart.Position.Y - self.rootPart.Position.Y)
+            local SameHeight = HeightDifference < 3
+            local ClosestPos = closestTarget.HumanoidRootPart.Position
+
+            if self.enemyExtended and LungeCooldown and SameHeight and Distance > 6 and EnemyTool then
+                self.toolGrip = Grips.Up
+                self.rootPart.CFrame = (FairLookAt(self.rootPart.Position, EnemyTool.Handle.Position + closestTarget.HumanoidRootPart.CFrame.LookVector * EnemyTool.Handle.Size.Y * 2.2))
+            else
+                local tool = self.character:FindFirstChildOfClass("Tool")
+                if tool and tool.Parent ~= self.character then
+                    tool:Activate()
+                    tool.Parent = self.character
+                end
+                local closestPart = Funcs.GetClosestPart(tool.Handle.Position, closestTarget)
+                if closestPart then
+                    self.rootPart.CFrame = (CFrame.lookAt(self.rootPart.Position, (closestPart.Position - Vector3.new(0, closestPart.Position.Y - self.rootPart.Position.Y, 0))) * CFrame.Angles(0, math.rad(17.5), 0))
+                end
+                local Angle = 0
+                local LastAngle = Angle
+                for i = 1, 10 do
+                    Angle = Angle + Funcs.FindBestAngle(self, closestTarget, EnemyTool)
+                    if LastAngle == Angle then
+                        if HigherHp then
+                            Angle += math.random(-10, 10)
+                        else
+                            Angle += math.random(-2, 2)
+                        end
+                        if closestPart then
+                            self.rootPart.CFrame = (CFrame.lookAt(self.rootPart.Position, (closestPart.Position - Vector3.new(0, closestPart.Position.Y - self.rootPart.Position.Y, 0))) * CFrame.Angles(0, math.rad(17.5 + Angle), 0))
+                        end
+                        break
+                    end
+                    LastAngle = Angle
+                    if closestPart then
+                        self.rootPart.CFrame = (CFrame.lookAt(self.rootPart.Position, (closestPart.Position - Vector3.new(0, closestPart.Position.Y - self.rootPart.Position.Y, 0))) * CFrame.Angles(0, math.rad(17.5 + Angle), 0))
+                    end
+                end
+            end
+
+            local EnemyToModelVector = (self.rootPart.Position - closestTarget.HumanoidRootPart.Position).Unit
+            local MoveDirection = closestTarget.Humanoid.MoveDirection
+            local EnemyIsMovingTowardsModel = (EnemyToModelVector - MoveDirection).Magnitude < 1
+            local IdealDistance = self.enemyExtended and 8 or 7
+            IdealDistance += EnemyIsMovingTowardsModel and 2 or 0
+
+            if self.toolGrip == Grips.Up then
+                self.lastAttackTime = tick()
+            end
+
+            if EnemyTool and not EnemyTool.Enabled and (tick() - self.LastOpponentAttack > 0.1) and not (tick() - self.LastOpponentAttack < 0.2) and (tick() - self.lastAttackTime > 0.05) then
+                IdealDistance -= 2
+            end
+
+            if (tick() - self.lastAttackTime > 0.5) then
+                IdealDistance += 2
+            end
+
+            if XDist < 15 then
+                local tool = self.character:FindFirstChildOfClass("Tool")
+                if tool then
+                    tool:Activate()
+                end
+            end
+
+            if Distance > 8 then
+                if LowerHp then
+                    IdealDistance += 10
+                end
+            end
+
+            local Offset = -closestTarget.HumanoidRootPart.CFrame.RightVector
+            local SideCast = Funcs.SideCast(closestTarget)
+
+            if HigherHp and SameHeight then
+                Offset *= 3
+                IdealDistance = 2
+            end
+
+            if SideCast or self.toolGrip == Grips.Up then
+                Offset = Vector3.new(0, 0, 0)
+            end
+
+            local SpacedPosition = (ClosestPos - (ClosestPos - self.rootPart.Position).Unit * IdealDistance) + Offset
+            if HigherHp then
+                Offset *= 3
+            end
+
+            if Distance < IdealDistance then
+                local RetreatPos = Funcs.GetRetreatDirection(self, closestTarget, 10)
+                if RetreatPos and EnemyIsMovingTowardsModel then
+                    RetreatPos = Funcs.GetRetreatDirection(self, closestTarget, 100)
+                    self:Move(RetreatPos)
+                else
+                    self:Move(SpacedPosition)
+                end
+            else
+                self:Move(SpacedPosition)
+            end
+        end
+    end
+end
+
+-- Create the AI
+local advancedAI = AdvancedAI.new()
+
+-- GUI setup
+local ScreenGui = Instance.new("ScreenGui")
+ScreenGui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+
+local DraggableFrame = Instance.new("Frame")
+DraggableFrame.Size = UDim2.new(0, 120, 0, 70)
+DraggableFrame.Position = UDim2.new(1, -130, 1, -80)
+DraggableFrame.AnchorPoint = Vector2.new(1, 1)
+DraggableFrame.BackgroundTransparency = 0.5
+DraggableFrame.BackgroundColor3 = Color3.new(0, 0, 0)
+DraggableFrame.Parent = ScreenGui
+
+local ToggleButton = Instance.new("TextButton")
+ToggleButton.Size = UDim2.new(1, -10, 1, -10)
+ToggleButton.Position = UDim2.new(0, 5, 0, 5)
+ToggleButton.Text = "Bot: OFF"
+ToggleButton.Parent = DraggableFrame
+
+-- Make the frame draggable
+local dragging
+local dragInput
+local dragStart
+local startPos
+
+local function update(input)
+    local delta = input.Position - dragStart
+    DraggableFrame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+end
+
+DraggableFrame.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+        dragging = true
+        dragStart = input.Position
+        startPos = DraggableFrame.Position
+
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then
+                dragging = false
+            end
+        end)
+    end
+end)
+
+DraggableFrame.InputChanged:Connect(function(input) {
+    if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseMovement then
+        dragInput = input
+    end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+    if input == dragInput and dragging then
+        update(input)
+    end
+end)
+
+-- Toggle button functionality
+ToggleButton.MouseButton1Click:Connect(function()
+    advancedAI.isActive = not advancedAI.isActive
+    ToggleButton.Text = advancedAI.isActive and "Bot: ON" or "Bot: OFF"
+    if advancedAI.isActive then
+        if not advancedAI.heartbeatConnection then
+            advancedAI.heartbeatConnection = RunService.Heartbeat:Connect(function()
+                advancedAI:Think()
+            end)
+        end
+    else
+        if advancedAI.heartbeatConnection then
+            advancedAI.heartbeatConnection:Disconnect()
+            advancedAI.heartbeatConnection = nil
+        end
+    end
+end)
+
+-- Start the AI
+--advancedAI:Think() -- No longer starts automatically, controlled by the toggle
+
+print("Advanced AI script loaded. Use the on-screen button to toggle the bot.")
